@@ -1009,6 +1009,7 @@ class DownBlockMotion(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        motion_attention_kwargs,
         temb: Optional[torch.Tensor] = None,
         num_frames: int = 1,
         *args,
@@ -1044,7 +1045,7 @@ class DownBlockMotion(nn.Module):
 
             else:
                 hidden_states = resnet(hidden_states, temb)
-            hidden_states = motion_module(hidden_states, num_frames=num_frames)[0]
+            hidden_states = motion_module(hidden_states, num_frames=num_frames, cross_attention_kwargs=motion_attention_kwargs)[0]
 
             output_states = output_states + (hidden_states,)
 
@@ -1175,6 +1176,7 @@ class CrossAttnDownBlockMotion(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        motion_attention_kwargs,
         temb: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -1230,6 +1232,7 @@ class CrossAttnDownBlockMotion(nn.Module):
             hidden_states = motion_module(
                 hidden_states,
                 num_frames=num_frames,
+                cross_attention_kwargs=motion_attention_kwargs,
             )[0]
 
             # apply additional residuals to the output of the last pair of resnet and attention blocks
@@ -1358,6 +1361,7 @@ class CrossAttnUpBlockMotion(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        motion_attention_kwargs,
         res_hidden_states_tuple: Tuple[torch.Tensor, ...],
         temb: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
@@ -1437,6 +1441,7 @@ class CrossAttnUpBlockMotion(nn.Module):
             hidden_states = motion_module(
                 hidden_states,
                 num_frames=num_frames,
+                cross_attention_kwargs=motion_attention_kwargs,
             )[0]
 
         if self.upsamplers is not None:
@@ -1519,6 +1524,7 @@ class UpBlockMotion(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        motion_attention_kwargs,
         res_hidden_states_tuple: Tuple[torch.Tensor, ...],
         temb: Optional[torch.Tensor] = None,
         upsample_size=None,
@@ -1580,7 +1586,11 @@ class UpBlockMotion(nn.Module):
 
             else:
                 hidden_states = resnet(hidden_states, temb)
-            hidden_states = motion_module(hidden_states, num_frames=num_frames)[0]
+            hidden_states = motion_module(
+                hidden_states,
+                num_frames=num_frames,
+                cross_attention_kwargs=motion_attention_kwargs,
+            )[0]
 
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
@@ -1700,6 +1710,7 @@ class UNetMidBlockCrossAttnMotion(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        motion_attention_kwargs,
         temb: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -1759,6 +1770,7 @@ class UNetMidBlockCrossAttnMotion(nn.Module):
                 hidden_states = motion_module(
                     hidden_states,
                     num_frames=num_frames,
+                    cross_attention_kwargs=motion_attention_kwargs,
                 )[0]
                 hidden_states = resnet(hidden_states, temb)
 

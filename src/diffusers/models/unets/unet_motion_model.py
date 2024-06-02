@@ -955,10 +955,16 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
                     attention_mask=attention_mask,
                     num_frames=num_frames,
                     cross_attention_kwargs=cross_attention_kwargs,
-                    key_scale=key_scale,
+                    motion_attention_kwargs={'key_scale': key_scale},
                 )
             else:
-                sample, res_samples = downsample_block(hidden_states=sample, temb=emb, num_frames=num_frames, key_scale=key_scale)
+                sample, res_samples = downsample_block(
+                    hidden_states=sample,
+                    temb=emb,
+                    num_frames=num_frames,
+                    key_scale=key_scale,
+                    motion_attention_kwargs={'key_scale': key_scale},
+                )
 
             down_block_res_samples += res_samples
 
@@ -985,6 +991,7 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
                     num_frames=num_frames,
                     cross_attention_kwargs=cross_attention_kwargs,
                     key_scale=key_scale,
+                    motion_attention_kwargs={'key_scale': key_scale},
                 )
             else:
                 sample = self.mid_block(
@@ -1020,7 +1027,7 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
                     attention_mask=attention_mask,
                     num_frames=num_frames,
                     cross_attention_kwargs=cross_attention_kwargs,
-                    key_scale=key_scale,
+                    motion_attention_kwargs={'key_scale': key_scale},
                 )
             else:
                 sample = upsample_block(
@@ -1029,6 +1036,7 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
                     res_hidden_states_tuple=res_samples,
                     upsample_size=upsample_size,
                     num_frames=num_frames,
+                    motion_attention_kwargs={'key_scale': key_scale},
                 )
 
         # 6. post-process

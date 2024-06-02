@@ -922,6 +922,7 @@ class AnimateDiffSDXLPipeline(
         multiprompt: bool = False,
         ctx_size: int = None,
         ctx_overlap: int = None,
+        key_scale = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -1207,6 +1208,7 @@ class AnimateDiffSDXLPipeline(
                         added_cond_kwargs=added_cond_kwargs,
                         return_dict=False,
                         multiprompt=multiprompt,
+                        key_scale=key_scale, # TODO
                     )[0]
 
                     # perform guidance
@@ -1276,6 +1278,7 @@ class AnimateDiffSDXLPipeline(
                             added_cond_kwargs=sub_added_cond_kwargs,
                             return_dict=False,
                             multiprompt=multiprompt,
+                            key_scale=key_scale, # TODO
                         )[0]
                         
                         print('sub_noise_pred', sub_noise_pred.size())

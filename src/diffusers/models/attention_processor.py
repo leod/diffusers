@@ -1353,6 +1353,7 @@ class AttnProcessor2_0:
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         temb: Optional[torch.Tensor] = None,
+        key_scale = None,
         *args,
         **kwargs,
     ) -> torch.Tensor:
@@ -1392,6 +1393,10 @@ class AttnProcessor2_0:
 
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
+        
+        if key_scale is not None:
+            print('key_scale', key.size(), key_scale)
+            key *= key_scale
 
         inner_dim = key.shape[-1]
         head_dim = inner_dim // attn.heads
