@@ -15,6 +15,7 @@
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 from transformers import (
     CLIPImageProcessor,
@@ -24,23 +25,23 @@ from transformers import (
     CLIPVisionModelWithProjection,
 )
 
-from ...image_processor import PipelineImageInput
-from ...loaders import (
+from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
+from diffusers.loaders import (
     FromSingleFileMixin,
     IPAdapterMixin,
     StableDiffusionXLLoraLoaderMixin,
     TextualInversionLoaderMixin,
 )
-from ...models import AutoencoderKL, ImageProjection, MotionAdapter, UNet2DConditionModel, UNetMotionModel
-from ...models.attention_processor import (
+from diffusers.models import AutoencoderKL, ImageProjection, MotionAdapter, UNet2DConditionModel
+from diffusers.models.attention_processor import (
     AttnProcessor2_0,
     FusedAttnProcessor2_0,
     LoRAAttnProcessor2_0,
     LoRAXFormersAttnProcessor,
     XFormersAttnProcessor,
 )
-from ...models.lora import adjust_lora_scale_text_encoder
-from ...schedulers import (
+from diffusers.models.lora import adjust_lora_scale_text_encoder
+from diffusers.schedulers import (
     DDIMScheduler,
     DPMSolverMultistepScheduler,
     EulerAncestralDiscreteScheduler,
@@ -48,18 +49,18 @@ from ...schedulers import (
     LMSDiscreteScheduler,
     PNDMScheduler,
 )
-from ...utils import (
+from diffusers.utils import (
     USE_PEFT_BACKEND,
     logging,
     replace_example_docstring,
     scale_lora_layers,
     unscale_lora_layers,
 )
-from ...utils.torch_utils import randn_tensor
-from ...video_processor import VideoProcessor
-from ..free_init_utils import FreeInitMixin
-from ..pipeline_utils import DiffusionPipeline, StableDiffusionMixin
-from .pipeline_output import AnimateDiffPipelineOutput
+from diffusers.utils.torch_utils import randn_tensor
+from diffusers.pipelines.free_init_utils import FreeInitMixin
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline, StableDiffusionMixin
+from diffusers.pipelines.animatediff.pipeline_output import AnimateDiffPipelineOutput
+from diffusers.models.unets.unet_motion_model import UNetMotionModel
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -113,6 +114,28 @@ EXAMPLE_DOC_STRING = """
 """
 
 
+# Copied from diffusers.pipelines.animatediff.pipeline_animatediff.tensor2vid
+def tensor2vid(video: torch.Tensor, processor: "VaeImageProcessor", output_type: str = "np"):
+    batch_size, channels, num_frames, height, width = video.shape
+    outputs = []
+    for batch_idx in range(batch_size):
+        batch_vid = video[batch_idx].permute(1, 0, 2, 3)
+        batch_output = processor.postprocess(batch_vid, output_type)
+
+        outputs.append(batch_output)
+
+    if output_type == "np":
+        outputs = np.stack(outputs)
+
+    elif output_type == "pt":
+        outputs = torch.stack(outputs)
+
+    elif not output_type == "pil":
+        raise ValueError(f"{output_type} does not exist. Please choose one of ['np', 'pt', 'pil']")
+
+    return outputs
+
+
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.rescale_noise_cfg
 def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
     """
@@ -134,7 +157,6 @@ def retrieve_timesteps(
     num_inference_steps: Optional[int] = None,
     device: Optional[Union[str, torch.device]] = None,
     timesteps: Optional[List[int]] = None,
-    sigmas: Optional[List[float]] = None,
     **kwargs,
 ):
     """
@@ -150,18 +172,14 @@ def retrieve_timesteps(
         device (`str` or `torch.device`, *optional*):
             The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
         timesteps (`List[int]`, *optional*):
-            Custom timesteps used to override the timestep spacing strategy of the scheduler. If `timesteps` is passed,
-            `num_inference_steps` and `sigmas` must be `None`.
-        sigmas (`List[float]`, *optional*):
-            Custom sigmas used to override the timestep spacing strategy of the scheduler. If `sigmas` is passed,
-            `num_inference_steps` and `timesteps` must be `None`.
+                Custom timesteps used to support arbitrary spacing between timesteps. If `None`, then the default
+                timestep spacing strategy of the scheduler is used. If `timesteps` is passed, `num_inference_steps`
+                must be `None`.
 
     Returns:
         `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
         second element is the number of inference steps.
     """
-    if timesteps is not None and sigmas is not None:
-        raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
     if timesteps is not None:
         accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
         if not accepts_timesteps:
@@ -172,20 +190,36 @@ def retrieve_timesteps(
         scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
-    elif sigmas is not None:
-        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if not accept_sigmas:
-            raise ValueError(
-                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
-                f" sigmas schedules. Please check whether you are using the correct scheduler."
-            )
-        scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
     else:
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
+
+
+# from SDfu
+# sliding sampling for long videos
+# from https://github.com/ArtVentureX/comfyui-animatediff/blob/main/animatediff/sliding_schedule.py
+def ordered_halving(val, verbose=False): # Returns fraction that has denominator that is a power of 2
+    bin_str = f"{val:064b}" # get binary value, padded with 0s for 64 bits
+    bin_flip = bin_str[::-1] # flip binary value, padding included
+    as_int = int(bin_flip, 2) # convert binary to int
+    final = as_int / (1 << 64) # divide by 1 << 64, equivalent to 2**64, or 18446744073709551616, or 1 with 64 zero's
+    if verbose: print(f"$$$$ final: {final}")
+    return final
+
+# generate lists of latent indices to process
+def uniform_slide(step, num_frames, ctx_size=16, ctx_stride=1, ctx_overlap=4, loop=True, verbose=False):
+    if num_frames <= ctx_size:
+        yield list(range(num_frames))
+        return
+    ctx_stride = min(ctx_stride, int(np.ceil(np.log2(num_frames / ctx_size))) + 1)
+    pad = int(round(num_frames * ordered_halving(step, verbose)))
+    fstop = num_frames + pad + (0 if loop else -ctx_overlap)
+    for ctx_step in 1 << np.arange(ctx_stride):
+        fstart = int(ordered_halving(step) * ctx_step) + pad
+        fstep = ctx_size * ctx_step - ctx_overlap
+        for j in range(fstart, fstop, fstep):
+            yield [e % num_frames for e in range(j, j + ctx_size * ctx_step, ctx_step)]
 
 
 class AnimateDiffSDXLPipeline(
@@ -298,7 +332,7 @@ class AnimateDiffSDXLPipeline(
         )
         self.register_to_config(force_zeros_for_empty_prompt=force_zeros_for_empty_prompt)
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
-        self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor)
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
 
         self.default_sample_size = self.unet.config.sample_size
 
@@ -312,10 +346,10 @@ class AnimateDiffSDXLPipeline(
         do_classifier_free_guidance: bool = True,
         negative_prompt: Optional[str] = None,
         negative_prompt_2: Optional[str] = None,
-        prompt_embeds: Optional[torch.Tensor] = None,
-        negative_prompt_embeds: Optional[torch.Tensor] = None,
-        pooled_prompt_embeds: Optional[torch.Tensor] = None,
-        negative_pooled_prompt_embeds: Optional[torch.Tensor] = None,
+        prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
         lora_scale: Optional[float] = None,
         clip_skip: Optional[int] = None,
     ):
@@ -341,17 +375,17 @@ class AnimateDiffSDXLPipeline(
             negative_prompt_2 (`str` or `List[str]`, *optional*):
                 The prompt or prompts not to guide the image generation to be sent to `tokenizer_2` and
                 `text_encoder_2`. If not defined, `negative_prompt` is used in both text-encoders
-            prompt_embeds (`torch.Tensor`, *optional*):
+            prompt_embeds (`torch.FloatTensor`, *optional*):
                 Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
                 provided, text embeddings will be generated from `prompt` input argument.
-            negative_prompt_embeds (`torch.Tensor`, *optional*):
+            negative_prompt_embeds (`torch.FloatTensor`, *optional*):
                 Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
                 weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
                 argument.
-            pooled_prompt_embeds (`torch.Tensor`, *optional*):
+            pooled_prompt_embeds (`torch.FloatTensor`, *optional*):
                 Pre-generated pooled text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting.
                 If not provided, pooled text embeddings will be generated from `prompt` input argument.
-            negative_pooled_prompt_embeds (`torch.Tensor`, *optional*):
+            negative_pooled_prompt_embeds (`torch.FloatTensor`, *optional*):
                 Pre-generated negative pooled text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
                 weighting. If not provided, pooled negative_prompt_embeds will be generated from `negative_prompt`
                 input argument.
@@ -784,7 +818,7 @@ class AnimateDiffSDXLPipeline(
     # Copied from diffusers.pipelines.latent_consistency_models.pipeline_latent_consistency_text2img.LatentConsistencyModelPipeline.get_guidance_scale_embedding
     def get_guidance_scale_embedding(
         self, w: torch.Tensor, embedding_dim: int = 512, dtype: torch.dtype = torch.float32
-    ) -> torch.Tensor:
+    ) -> torch.FloatTensor:
         """
         See https://github.com/google-research/vdm/blob/dc27b98a554f65cdc654b800da5aa1846545d41b/model_vdm.py#L298
 
@@ -797,7 +831,7 @@ class AnimateDiffSDXLPipeline(
                 Data type of the generated embeddings.
 
         Returns:
-            `torch.Tensor`: Embedding vectors with shape `(len(w), embedding_dim)`.
+            `torch.FloatTensor`: Embedding vectors with shape `(len(w), embedding_dim)`.
         """
         assert len(w.shape) == 1
         w = w * 1000.0
@@ -858,7 +892,6 @@ class AnimateDiffSDXLPipeline(
         width: Optional[int] = None,
         num_inference_steps: int = 50,
         timesteps: List[int] = None,
-        sigmas: List[float] = None,
         denoising_end: Optional[float] = None,
         guidance_scale: float = 5.0,
         negative_prompt: Optional[Union[str, List[str]]] = None,
@@ -866,13 +899,13 @@ class AnimateDiffSDXLPipeline(
         num_videos_per_prompt: Optional[int] = 1,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        latents: Optional[torch.Tensor] = None,
-        prompt_embeds: Optional[torch.Tensor] = None,
-        negative_prompt_embeds: Optional[torch.Tensor] = None,
-        pooled_prompt_embeds: Optional[torch.Tensor] = None,
-        negative_pooled_prompt_embeds: Optional[torch.Tensor] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
         ip_adapter_image: Optional[PipelineImageInput] = None,
-        ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,
+        ip_adapter_image_embeds: Optional[List[torch.FloatTensor]] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -886,6 +919,9 @@ class AnimateDiffSDXLPipeline(
         clip_skip: Optional[int] = None,
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        multiprompt: bool = False,
+        ctx_size: int = None,
+        ctx_overlap: int = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -917,10 +953,6 @@ class AnimateDiffSDXLPipeline(
                 Custom timesteps to use for the denoising process with schedulers which support a `timesteps` argument
                 in their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is
                 passed will be used. Must be in descending order.
-            sigmas (`List[float]`, *optional*):
-                Custom sigmas to use for the denoising process with schedulers which support a `sigmas` argument in
-                their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is passed
-                will be used.
             denoising_end (`float`, *optional*):
                 When specified, determines the fraction (between 0.0 and 1.0) of the total denoising process to be
                 completed before it is intentionally prematurely terminated. As a result, the returned sample will
@@ -949,27 +981,27 @@ class AnimateDiffSDXLPipeline(
             generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
                 One or a list of [torch generator(s)](https://pytorch.org/docs/stable/generated/torch.Generator.html)
                 to make generation deterministic.
-            latents (`torch.Tensor`, *optional*):
+            latents (`torch.FloatTensor`, *optional*):
                 Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for video
                 generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
                 tensor will ge generated by sampling using the supplied random `generator`.
-            prompt_embeds (`torch.Tensor`, *optional*):
+            prompt_embeds (`torch.FloatTensor`, *optional*):
                 Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
                 provided, text embeddings will be generated from `prompt` input argument.
-            negative_prompt_embeds (`torch.Tensor`, *optional*):
+            negative_prompt_embeds (`torch.FloatTensor`, *optional*):
                 Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
                 weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
                 argument.
-            pooled_prompt_embeds (`torch.Tensor`, *optional*):
+            pooled_prompt_embeds (`torch.FloatTensor`, *optional*):
                 Pre-generated pooled text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting.
                 If not provided, pooled text embeddings will be generated from `prompt` input argument.
-            negative_pooled_prompt_embeds (`torch.Tensor`, *optional*):
+            negative_pooled_prompt_embeds (`torch.FloatTensor`, *optional*):
                 Pre-generated negative pooled text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
                 weighting. If not provided, pooled negative_prompt_embeds will be generated from `negative_prompt`
                 input argument.
             ip_adapter_image: (`PipelineImageInput`, *optional*):
                 Optional image input to work with IP Adapters.
-            ip_adapter_image_embeds (`List[torch.Tensor]`, *optional*):
+            ip_adapter_image_embeds (`List[torch.FloatTensor]`, *optional*):
                 Pre-generated image embeddings for IP-Adapter. If not provided, embeddings are computed from the
                 `ip_adapter_image` input argument.
             output_type (`str`, *optional*, defaults to `"pil"`):
@@ -1066,12 +1098,7 @@ class AnimateDiffSDXLPipeline(
         self._interrupt = False
 
         # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
+        batch_size = 1
 
         device = self._execution_device
 
@@ -1102,9 +1129,7 @@ class AnimateDiffSDXLPipeline(
         )
 
         # 4. Prepare timesteps
-        timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler, num_inference_steps, device, timesteps, sigmas
-        )
+        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
 
         # 5. Prepare latent variables
         num_channels_latents = self.unet.config.in_channels
@@ -1148,63 +1173,23 @@ class AnimateDiffSDXLPipeline(
         else:
             negative_add_time_ids = add_time_ids
 
-        if self.do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-            add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
-            add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
-
-        prompt_embeds = prompt_embeds.to(device)
-        add_text_embeds = add_text_embeds.to(device)
-        add_time_ids = add_time_ids.to(device).repeat(batch_size * num_videos_per_prompt, 1)
-
-        if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
-            image_embeds = self.prepare_ip_adapter_image_embeds(
-                ip_adapter_image,
-                ip_adapter_image_embeds,
-                device,
-                batch_size * num_videos_per_prompt,
-                self.do_classifier_free_guidance,
-            )
-
-        # 7.1 Apply denoising_end
-        if (
-            self.denoising_end is not None
-            and isinstance(self.denoising_end, float)
-            and self.denoising_end > 0
-            and self.denoising_end < 1
-        ):
-            discrete_timestep_cutoff = int(
-                round(
-                    self.scheduler.config.num_train_timesteps
-                    - (self.denoising_end * self.scheduler.config.num_train_timesteps)
-                )
-            )
-            num_inference_steps = len(list(filter(lambda ts: ts >= discrete_timestep_cutoff, timesteps)))
-            timesteps = timesteps[:num_inference_steps]
-
         # 8. Optionally get Guidance Scale Embedding
         timestep_cond = None
-        if self.unet.config.time_cond_proj_dim is not None:
-            guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(batch_size * num_videos_per_prompt)
-            timestep_cond = self.get_guidance_scale_embedding(
-                guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
-            ).to(device=device, dtype=latents.dtype)
+        self._num_timesteps = len(timesteps)
 
-        num_free_init_iters = self._free_init_num_iters if self.free_init_enabled else 1
-        for free_init_iter in range(num_free_init_iters):
-            if self.free_init_enabled:
-                latents, timesteps = self._apply_free_init(
-                    latents, free_init_iter, num_inference_steps, device, latents.dtype, generator
-                )
+        # 9. Denoising loop
+        if ctx_size is None:
+            if self.do_classifier_free_guidance:
+                prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+                add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
+                add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
 
-            self._num_timesteps = len(timesteps)
+            prompt_embeds = prompt_embeds.to(device)
+            add_text_embeds = add_text_embeds.to(device)
+            add_time_ids = add_time_ids.to(device).repeat(batch_size * num_videos_per_prompt, 1)
 
-            # 9. Denoising loop
             with self.progress_bar(total=self._num_timesteps) as progress_bar:
-                for i, t in enumerate(timesteps):
-                    if self.interrupt:
-                        continue
-
+                for t in timesteps:
                     # expand the latents if we are doing classifier free guidance
                     latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
 
@@ -1212,8 +1197,6 @@ class AnimateDiffSDXLPipeline(
 
                     # predict the noise residual
                     added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
-                    if ip_adapter_image is not None or ip_adapter_image_embeds:
-                        added_cond_kwargs["image_embeds"] = image_embeds
 
                     noise_pred = self.unet(
                         latent_model_input,
@@ -1223,6 +1206,7 @@ class AnimateDiffSDXLPipeline(
                         cross_attention_kwargs=self.cross_attention_kwargs,
                         added_cond_kwargs=added_cond_kwargs,
                         return_dict=False,
+                        multiprompt=multiprompt,
                     )[0]
 
                     # perform guidance
@@ -1230,30 +1214,78 @@ class AnimateDiffSDXLPipeline(
                         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                         noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-                    if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
-                        # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
-                        noise_pred = rescale_noise_cfg(
-                            noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale
-                        )
-
                     # compute the previous noisy sample x_t -> x_t-1
                     latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
-                    if callback_on_step_end is not None:
-                        callback_kwargs = {}
-                        for k in callback_on_step_end_tensor_inputs:
-                            callback_kwargs[k] = locals()[k]
-                        callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                    progress_bar.update()
+        else:
+            assert self.do_classifier_free_guidance
 
-                        latents = callback_outputs.pop("latents", latents)
-                        prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                        negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
-                        add_text_embeds = callback_outputs.pop("add_text_embeds", add_text_embeds)
-                        negative_pooled_prompt_embeds = callback_outputs.pop(
-                            "negative_pooled_prompt_embeds", negative_pooled_prompt_embeds
-                        )
-                        add_time_ids = callback_outputs.pop("add_time_ids", add_time_ids)
-                        negative_add_time_ids = callback_outputs.pop("negative_add_time_ids", negative_add_time_ids)
+            add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
+            add_time_ids = add_time_ids.to(device).repeat(batch_size * num_videos_per_prompt, 1)
+            
+            print('latents', latents.size())
+            print('negative_prompt_embeds', negative_prompt_embeds.size())
+            print('prompt_embeds', prompt_embeds.size())
+            print('negative_pooled_prompt_embeds', negative_pooled_prompt_embeds.size())
+            print('add_text_embeds', add_text_embeds.size())
+            print('add_time_ids', add_time_ids.size())
+
+            with self.progress_bar(total=self._num_timesteps) as progress_bar:
+                for tnum, t in enumerate(timesteps):
+                    latent_model_input = torch.cat([latents] * 2)
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                    
+                    noise_pred_sum = torch.zeros_like(latents)
+                    noise_pred_count = torch.zeros((1, 1, num_frames, 1, 1), device=noise_pred_sum.device)
+                    
+                    print('latent_model_input', latent_model_input.size())
+                    print('noise_pred_sum', noise_pred_sum.size())
+                    print('noise_pred_count', noise_pred_count.size())
+
+                    for slids in uniform_slide(tnum, num_frames, ctx_size=ctx_size, ctx_overlap=ctx_overlap, loop=False):
+                        print('slids', slids)
+
+                        sub_negative_prompt_embeds = negative_prompt_embeds[slids]
+                        sub_prompt_embeds = prompt_embeds[slids]
+                        sub_negative_pooled_prompt_embeds = negative_pooled_prompt_embeds[slids]
+                        sub_add_text_embeds = add_text_embeds[slids]
+
+                        print('sub_negative_prompt_embeds', sub_negative_prompt_embeds.size())
+                        print('sub_prompt_embeds', sub_prompt_embeds.size())
+                        print('sub_negative_pooled_prompt_embeds', sub_negative_pooled_prompt_embeds.size())
+                        print('sub_add_text_embeds', sub_add_text_embeds.size())
+
+                        sub_prompt_embeds = torch.cat([sub_negative_prompt_embeds, sub_prompt_embeds], dim=0)
+                        sub_add_text_embeds = torch.cat([sub_negative_pooled_prompt_embeds, sub_add_text_embeds], dim=0)
+                        
+                        print('sub_prompt_embeds final', sub_prompt_embeds.size())
+                        print('sub_add_text_embeds final', sub_add_text_embeds.size())
+
+                        sub_latent_model_input = latent_model_input[:, :, slids]
+                        sub_added_cond_kwargs = {"text_embeds": sub_add_text_embeds, "time_ids": add_time_ids}
+                        
+                        print('sub_latent_model_input', sub_latent_model_input.size())
+
+                        sub_noise_pred = self.unet(
+                            sub_latent_model_input,
+                            t,
+                            encoder_hidden_states=sub_prompt_embeds,
+                            timestep_cond=timestep_cond,
+                            cross_attention_kwargs=self.cross_attention_kwargs,
+                            added_cond_kwargs=sub_added_cond_kwargs,
+                            return_dict=False,
+                            multiprompt=multiprompt,
+                        )[0]
+                        
+                        print('sub_noise_pred', sub_noise_pred.size())
+
+                        sub_noise_pred_uncond, sub_noise_pred_text = sub_noise_pred.chunk(2)
+                        noise_pred_sum[:, :, slids] += sub_noise_pred_uncond + self.guidance_scale * (sub_noise_pred_text - sub_noise_pred_uncond)
+                        noise_pred_count[:, :, slids] += 1
+
+                    noise_pred_sum /= noise_pred_count
+                    latents = self.scheduler.step(noise_pred_sum, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
                     progress_bar.update()
 
@@ -1269,7 +1301,7 @@ class AnimateDiffSDXLPipeline(
             video = latents
         else:
             video_tensor = self.decode_latents(latents)
-            video = self.video_processor.postprocess_video(video=video_tensor, output_type=output_type)
+            video = tensor2vid(video_tensor, self.image_processor, output_type=output_type)
 
         # cast back to fp16 if needed
         if needs_upcasting:

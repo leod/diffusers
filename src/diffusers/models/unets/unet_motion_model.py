@@ -15,29 +15,25 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.utils.checkpoint
 
-from ...configuration_utils import ConfigMixin, FrozenDict, register_to_config
-from ...loaders import UNet2DConditionLoadersMixin
-from ...utils import logging
-from ..attention_processor import (
+from diffusers.configuration_utils import ConfigMixin, FrozenDict, register_to_config
+from diffusers.loaders import UNet2DConditionLoadersMixin
+from diffusers.utils import logging
+from diffusers.models.attention_processor import (
     ADDED_KV_ATTENTION_PROCESSORS,
     CROSS_ATTENTION_PROCESSORS,
     Attention,
     AttentionProcessor,
     AttnAddedKVProcessor,
     AttnProcessor,
-    AttnProcessor2_0,
-    IPAdapterAttnProcessor,
-    IPAdapterAttnProcessor2_0,
 )
-from ..embeddings import TimestepEmbedding, Timesteps
-from ..modeling_utils import ModelMixin
-from ..transformers.transformer_temporal import TransformerTemporalModel
-from .unet_2d_blocks import UNetMidBlock2DCrossAttn
-from .unet_2d_condition import UNet2DConditionModel
-from .unet_3d_blocks import (
+from diffusers.models.embeddings import TimestepEmbedding, Timesteps
+from diffusers.models.modeling_utils import ModelMixin
+from diffusers.models.transformers.transformer_temporal import TransformerTemporalModel
+from diffusers.models.unets.unet_2d_blocks import UNetMidBlock2DCrossAttn
+from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
+from diffusers.models.unets.unet_3d_blocks import (
     CrossAttnDownBlockMotion,
     CrossAttnUpBlockMotion,
     DownBlockMotion,
@@ -46,7 +42,7 @@ from .unet_3d_blocks import (
     get_down_block,
     get_up_block,
 )
-from .unet_3d_condition import UNet3DConditionOutput
+from diffusers.models.unets.unet_3d_condition import UNet3DConditionOutput
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -493,36 +489,7 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
 
         model.time_proj.load_state_dict(unet.time_proj.state_dict())
         model.time_embedding.load_state_dict(unet.time_embedding.state_dict())
-
-        if any(
-            isinstance(proc, (IPAdapterAttnProcessor, IPAdapterAttnProcessor2_0))
-            for proc in unet.attn_processors.values()
-        ):
-            attn_procs = {}
-            for name, processor in unet.attn_processors.items():
-                if name.endswith("attn1.processor"):
-                    attn_processor_class = (
-                        AttnProcessor2_0 if hasattr(F, "scaled_dot_product_attention") else AttnProcessor
-                    )
-                    attn_procs[name] = attn_processor_class()
-                else:
-                    attn_processor_class = (
-                        IPAdapterAttnProcessor2_0
-                        if hasattr(F, "scaled_dot_product_attention")
-                        else IPAdapterAttnProcessor
-                    )
-                    attn_procs[name] = attn_processor_class(
-                        hidden_size=processor.hidden_size,
-                        cross_attention_dim=processor.cross_attention_dim,
-                        scale=processor.scale,
-                        num_tokens=processor.num_tokens,
-                    )
-            for name, processor in model.attn_processors.items():
-                if name not in attn_procs:
-                    attn_procs[name] = processor.__class__()
-            model.set_attn_processor(attn_procs)
-            model.config.encoder_hid_dim_type = "ip_image_proj"
-            model.encoder_hid_proj = unet.encoder_hid_proj
+        model.add_embedding.load_state_dict(unet.add_embedding.state_dict())
 
         for i, down_block in enumerate(unet.down_blocks):
             model.down_blocks[i].resnets.load_state_dict(down_block.resnets.state_dict())
@@ -820,7 +787,7 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
 
     def forward(
         self,
-        sample: torch.Tensor,
+        sample: torch.FloatTensor,
         timestep: Union[torch.Tensor, float, int],
         encoder_hidden_states: torch.Tensor,
         timestep_cond: Optional[torch.Tensor] = None,
@@ -830,15 +797,17 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
         down_block_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
         mid_block_additional_residual: Optional[torch.Tensor] = None,
         return_dict: bool = True,
+        multiprompt: bool = False,
+        key_scale: Optional[torch.Tensor] = None,
     ) -> Union[UNet3DConditionOutput, Tuple[torch.Tensor]]:
         r"""
         The [`UNetMotionModel`] forward method.
 
         Args:
-            sample (`torch.Tensor`):
+            sample (`torch.FloatTensor`):
                 The noisy input tensor with the following shape `(batch, num_frames, channel, height, width`.
-            timestep (`torch.Tensor` or `float` or `int`): The number of timesteps to denoise an input.
-            encoder_hidden_states (`torch.Tensor`):
+            timestep (`torch.FloatTensor` or `float` or `int`): The number of timesteps to denoise an input.
+            encoder_hidden_states (`torch.FloatTensor`):
                 The encoder hidden states with shape `(batch, sequence_length, feature_dim)`.
             timestep_cond: (`torch.Tensor`, *optional*, defaults to `None`):
                 Conditional embeddings for timestep. If provided, the embeddings will be summed with the samples passed
@@ -923,16 +892,43 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
                     f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `time_ids` to be passed in `added_cond_kwargs`"
                 )
             time_ids = added_cond_kwargs.get("time_ids")
+
+            #print("time_ids", time_ids.size())
             time_embeds = self.add_time_proj(time_ids.flatten())
-            time_embeds = time_embeds.reshape((text_embeds.shape[0], -1))
+            #print("time_embeds", time_embeds.size())
 
+            if multiprompt:
+                time_embeds = time_embeds.reshape((text_embeds.shape[0] // num_frames, -1))
+            else:
+                time_embeds = time_embeds.reshape((text_embeds.shape[0], -1))
+            #print("time_embeds 2", time_embeds.size())
+
+            if multiprompt:
+                # Prompt Travel: ADDED
+                time_embeds = time_embeds.repeat_interleave(repeats=num_frames, dim=0)
+                #print("final time_embeds", time_embeds.size())
+
+            #print("text_embeds", text_embeds.size())
             add_embeds = torch.concat([text_embeds, time_embeds], dim=-1)
-            add_embeds = add_embeds.to(emb.dtype)
-            aug_emb = self.add_embedding(add_embeds)
+            #print("add_embeds", add_embeds.size())
 
+            add_embeds = add_embeds.to(emb.dtype)
+
+            aug_emb = self.add_embedding(add_embeds)
+            #print("aug_emb", aug_emb.size())
+
+        #print("emb", emb.size())
+        if multiprompt:
+            emb = emb.repeat_interleave(repeats=num_frames, dim=0)
+        #print("emb 2", emb.size())
         emb = emb if aug_emb is None else emb + aug_emb
-        emb = emb.repeat_interleave(repeats=num_frames, dim=0)
-        encoder_hidden_states = encoder_hidden_states.repeat_interleave(repeats=num_frames, dim=0)
+
+        if not multiprompt:
+            emb = emb.repeat_interleave(repeats=num_frames, dim=0)
+            encoder_hidden_states = encoder_hidden_states.repeat_interleave(repeats=num_frames, dim=0)
+
+        #print("final emb", emb.size())
+        #print("final encoder_hidden_states", encoder_hidden_states.size())
 
         if self.encoder_hid_proj is not None and self.config.encoder_hid_dim_type == "ip_image_proj":
             if "image_embeds" not in added_cond_kwargs:
@@ -959,9 +955,10 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
                     attention_mask=attention_mask,
                     num_frames=num_frames,
                     cross_attention_kwargs=cross_attention_kwargs,
+                    key_scale=key_scale,
                 )
             else:
-                sample, res_samples = downsample_block(hidden_states=sample, temb=emb, num_frames=num_frames)
+                sample, res_samples = downsample_block(hidden_states=sample, temb=emb, num_frames=num_frames, key_scale=key_scale)
 
             down_block_res_samples += res_samples
 
@@ -987,6 +984,7 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
                     attention_mask=attention_mask,
                     num_frames=num_frames,
                     cross_attention_kwargs=cross_attention_kwargs,
+                    key_scale=key_scale,
                 )
             else:
                 sample = self.mid_block(
@@ -1022,6 +1020,7 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
                     attention_mask=attention_mask,
                     num_frames=num_frames,
                     cross_attention_kwargs=cross_attention_kwargs,
+                    key_scale=key_scale,
                 )
             else:
                 sample = upsample_block(
