@@ -1396,7 +1396,16 @@ class AttnProcessor2_0:
         
         if key_scale is not None:
             print('key_scale', key.size(), key_scale)
-            key *= key_scale
+
+            key_unfold = key.view(32, key.size(0) // 32, 16, -1)
+
+            print('key_unfold', key_unfold.size())
+
+            #key_scale = key_scale[None, :, None].to('cuda')
+            key_scale = key_scale[:, None, None, None].to('cuda')
+
+            print('key_scale_rep', key_scale.size())
+            key_unfold.mul_(key_scale)
 
         inner_dim = key.shape[-1]
         head_dim = inner_dim // attn.heads

@@ -1268,6 +1268,9 @@ class AnimateDiffSDXLPipeline(
                         sub_added_cond_kwargs = {"text_embeds": sub_add_text_embeds, "time_ids": add_time_ids}
                         
                         print('sub_latent_model_input', sub_latent_model_input.size())
+                        
+                        sub_key_scale = torch.cat([key_scale[slids]] * 2)
+                        print('sub_key_scale', sub_key_scale)
 
                         sub_noise_pred = self.unet(
                             sub_latent_model_input,
@@ -1278,7 +1281,7 @@ class AnimateDiffSDXLPipeline(
                             added_cond_kwargs=sub_added_cond_kwargs,
                             return_dict=False,
                             multiprompt=multiprompt,
-                            key_scale=key_scale, # TODO
+                            key_scale=sub_key_scale, # TODO
                         )[0]
                         
                         print('sub_noise_pred', sub_noise_pred.size())

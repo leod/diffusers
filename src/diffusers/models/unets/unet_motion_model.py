@@ -941,8 +941,11 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
             encoder_hidden_states = (encoder_hidden_states, image_embeds)
 
         # 2. pre-process
+        print('sample_in', sample.size())
         sample = sample.permute(0, 2, 1, 3, 4).reshape((sample.shape[0] * num_frames, -1) + sample.shape[3:])
+        print('sample', sample.size())
         sample = self.conv_in(sample)
+        print('sample_conv', sample.size())
 
         # 3. down
         down_block_res_samples = (sample,)
