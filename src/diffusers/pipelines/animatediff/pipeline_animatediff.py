@@ -740,7 +740,7 @@ class AnimateDiffPipeline(
             lora_scale=text_encoder_lora_scale,
             clip_skip=self.clip_skip,
         )
-        print('got', prompt_embeds.size(), negative_prompt_embeds.size())
+        print('prompt_embeds both', prompt_embeds.size(), negative_prompt_embeds.size())
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch
         # to avoid doing two forward passes
@@ -831,27 +831,27 @@ class AnimateDiffPipeline(
                     noise_pred_sum = torch.zeros_like(latents)
                     noise_pred_count = torch.zeros((1, 1, num_frames, 1, 1), device=noise_pred_sum.device)
                     
-                    print('latent_model_input', latent_model_input.size())
-                    print('noise_pred_sum', noise_pred_sum.size())
-                    print('noise_pred_count', noise_pred_count.size())
+                    #print('latent_model_input', latent_model_input.size())
+                    #print('noise_pred_sum', noise_pred_sum.size())
+                    #print('noise_pred_count', noise_pred_count.size())
 
                     for slids in uniform_slide(tnum, num_frames, ctx_size=ctx_size, ctx_overlap=ctx_overlap, loop=False):
                         print('slids', slids)
 
                         sub_negative_prompt_embeds = negative_prompt_embeds[slids]
-                        print('prompt_embeds access', prompt_embeds.size(), negative_prompt_embeds.size(), slids)
+                        #print('prompt_embeds access', prompt_embeds.size(), negative_prompt_embeds.size(), slids)
                         sub_prompt_embeds = prompt_embeds[slids]
 
-                        print('sub_negative_prompt_embeds', sub_negative_prompt_embeds.size())
-                        print('sub_prompt_embeds', sub_prompt_embeds.size())
+                        #print('sub_negative_prompt_embeds', sub_negative_prompt_embeds.size())
+                        #print('sub_prompt_embeds', sub_prompt_embeds.size())
 
                         sub_prompt_embeds = torch.cat([sub_negative_prompt_embeds, sub_prompt_embeds], dim=0)
                         
-                        print('sub_prompt_embeds final', sub_prompt_embeds.size())
+                        #print('sub_prompt_embeds final', sub_prompt_embeds.size())
 
                         sub_latent_model_input = latent_model_input[:, :, slids]
                         
-                        print('sub_latent_model_input', sub_latent_model_input.size())
+                        #print('sub_latent_model_input', sub_latent_model_input.size())
                         
                         # TODO
                         #sub_key_scale = torch.cat([key_scale[slids]] * 2)
@@ -868,7 +868,7 @@ class AnimateDiffPipeline(
                             # TODO: key_scale
                         )[0]
                         
-                        print('sub_noise_pred', sub_noise_pred.size())
+                        #print('sub_noise_pred', sub_noise_pred.size())
 
                         sub_noise_pred_uncond, sub_noise_pred_text = sub_noise_pred.chunk(2)
                         noise_pred_sum[:, :, slids] += sub_noise_pred_uncond + self.guidance_scale * (sub_noise_pred_text - sub_noise_pred_uncond)
