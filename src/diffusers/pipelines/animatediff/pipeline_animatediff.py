@@ -65,6 +65,34 @@ EXAMPLE_DOC_STRING = """
 """
 
 
+# from SDfu
+# sliding sampling for long videos
+# from https://github.com/ArtVentureX/comfyui-animatediff/blob/main/animatediff/sliding_schedule.py
+def ordered_halving(val, verbose=False): # Returns fraction that has denominator that is a power of 2
+    bin_str = f"{val:064b}" # get binary value, padded with 0s for 64 bits
+    bin_flip = bin_str[::-1] # flip binary value, padding included
+    as_int = int(bin_flip, 2) # convert binary to int
+    final = as_int / (1 << 64) # divide by 1 << 64, equivalent to 2**64, or 18446744073709551616, or 1 with 64 zero's
+    if verbose: print(f"$$$$ final: {final}")
+    return final
+
+# generate lists of latent indices to process
+def uniform_slide(step, num_frames, ctx_size=16, ctx_stride=1, ctx_overlap=4, loop=True, verbose=False):
+    import numpy as np
+
+    if num_frames <= ctx_size:
+        yield list(range(num_frames))
+        return
+    ctx_stride = min(ctx_stride, int(np.ceil(np.log2(num_frames / ctx_size))) + 1)
+    pad = int(round(num_frames * ordered_halving(step, verbose)))
+    fstop = num_frames + pad + (0 if loop else -ctx_overlap)
+    for ctx_step in 1 << np.arange(ctx_stride):
+        fstart = int(ordered_halving(step) * ctx_step) + pad
+        fstep = ctx_size * ctx_step - ctx_overlap
+        for j in range(fstart, fstop, fstep):
+            yield [e % num_frames for e in range(j, j + ctx_size * ctx_step, ctx_step)]
+
+
 class AnimateDiffPipeline(
     DiffusionPipeline,
     StableDiffusionMixin,
@@ -193,12 +221,7 @@ class AnimateDiffPipeline(
             else:
                 scale_lora_layers(self.text_encoder, lora_scale)
 
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
+        batch_size = prompt_embeds.shape[0]
 
         if prompt_embeds is None:
             # textual inversion: process multi-vector tokens if necessary
@@ -313,8 +336,8 @@ class AnimateDiffPipeline(
 
             negative_prompt_embeds = negative_prompt_embeds.to(dtype=prompt_embeds_dtype, device=device)
 
-            negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
-            negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+            negative_prompt_embeds = negative_prompt_embeds.repeat(1, batch_size, 1)
+            negative_prompt_embeds = negative_prompt_embeds.view(batch_size, seq_len, -1)
 
         if isinstance(self, LoraLoaderMixin) and USE_PEFT_BACKEND:
             # Retrieve the original scale by scaling back the LoRA layers
@@ -574,6 +597,9 @@ class AnimateDiffPipeline(
         clip_skip: Optional[int] = None,
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        multiprompt: bool = False,
+        ctx_size: int = None,
+        ctx_overlap: int = None,
         **kwargs,
     ):
         r"""
@@ -692,12 +718,7 @@ class AnimateDiffPipeline(
         self._cross_attention_kwargs = cross_attention_kwargs
 
         # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
+        batch_size = 1
 
         device = self._execution_device
 
@@ -759,17 +780,10 @@ class AnimateDiffPipeline(
             else None
         )
 
-        num_free_init_iters = self._free_init_num_iters if self.free_init_enabled else 1
-        for free_init_iter in range(num_free_init_iters):
-            if self.free_init_enabled:
-                latents, timesteps = self._apply_free_init(
-                    latents, free_init_iter, num_inference_steps, device, latents.dtype, generator
-                )
+        self._num_timesteps = len(timesteps)
 
-            self._num_timesteps = len(timesteps)
-            num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-
-            # 8. Denoising loop
+        # 8. Denoising loop
+        if ctx_size is None:
             with self.progress_bar(total=self._num_timesteps) as progress_bar:
                 for i, t in enumerate(timesteps):
                     # expand the latents if we are doing classifier free guidance
@@ -793,21 +807,69 @@ class AnimateDiffPipeline(
                     # compute the previous noisy sample x_t -> x_t-1
                     latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
-                    if callback_on_step_end is not None:
-                        callback_kwargs = {}
-                        for k in callback_on_step_end_tensor_inputs:
-                            callback_kwargs[k] = locals()[k]
-                        callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                    progress_bar.update()
+        else:
+            assert self.do_classifier_free_guidance
 
-                        latents = callback_outputs.pop("latents", latents)
-                        prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                        negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+            print('latents', latents.size())
+            print('prompt_embeds', prompt_embeds.size())
+            print('negative_prompt_embeds', negative_prompt_embeds.size())
 
-                    # call the callback, if provided
-                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                        progress_bar.update()
-                        if callback is not None and i % callback_steps == 0:
-                            callback(i, t, latents)
+            with self.progress_bar(total=self._num_timesteps) as progress_bar:
+                for tnum, t in enumerate(timesteps):
+                    latent_model_input = torch.cat([latents] * 2)
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                    
+                    noise_pred_sum = torch.zeros_like(latents)
+                    noise_pred_count = torch.zeros((1, 1, num_frames, 1, 1), device=noise_pred_sum.device)
+                    
+                    print('latent_model_input', latent_model_input.size())
+                    print('noise_pred_sum', noise_pred_sum.size())
+                    print('noise_pred_count', noise_pred_count.size())
+
+                    for slids in uniform_slide(tnum, num_frames, ctx_size=ctx_size, ctx_overlap=ctx_overlap, loop=False):
+                        print('slids', slids)
+
+                        sub_negative_prompt_embeds = negative_prompt_embeds[slids]
+                        print('prompt_embeds access', prompt_embeds.size(), negative_prompt_embeds.size(), slids)
+                        sub_prompt_embeds = prompt_embeds[slids]
+
+                        print('sub_negative_prompt_embeds', sub_negative_prompt_embeds.size())
+                        print('sub_prompt_embeds', sub_prompt_embeds.size())
+
+                        sub_prompt_embeds = torch.cat([sub_negative_prompt_embeds, sub_prompt_embeds], dim=0)
+                        
+                        print('sub_prompt_embeds final', sub_prompt_embeds.size())
+
+                        sub_latent_model_input = latent_model_input[:, :, slids]
+                        
+                        print('sub_latent_model_input', sub_latent_model_input.size())
+                        
+                        # TODO
+                        #sub_key_scale = torch.cat([key_scale[slids]] * 2)
+                        #print('sub_key_scale', sub_key_scale)
+
+                        sub_noise_pred = self.unet(
+                            sub_latent_model_input,
+                            t,
+                            encoder_hidden_states=sub_prompt_embeds,
+                            cross_attention_kwargs=self.cross_attention_kwargs,
+                            added_cond_kwargs=added_cond_kwargs,
+                            return_dict=False,
+                            multiprompt=True,
+                            # TODO: key_scale
+                        )[0]
+                        
+                        print('sub_noise_pred', sub_noise_pred.size())
+
+                        sub_noise_pred_uncond, sub_noise_pred_text = sub_noise_pred.chunk(2)
+                        noise_pred_sum[:, :, slids] += sub_noise_pred_uncond + self.guidance_scale * (sub_noise_pred_text - sub_noise_pred_uncond)
+                        noise_pred_count[:, :, slids] += 1
+
+                    noise_pred_sum /= noise_pred_count
+                    latents = self.scheduler.step(noise_pred_sum, t, latents, **extra_step_kwargs, return_dict=False)[0]
+
+                    progress_bar.update()
 
         # 9. Post processing
         if output_type == "latent":

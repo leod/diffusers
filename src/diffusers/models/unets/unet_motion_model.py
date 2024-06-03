@@ -489,7 +489,9 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
 
         model.time_proj.load_state_dict(unet.time_proj.state_dict())
         model.time_embedding.load_state_dict(unet.time_embedding.state_dict())
-        model.add_embedding.load_state_dict(unet.add_embedding.state_dict())
+        
+        # NOTE(leod): Only needed for XL!
+        #model.add_embedding.load_state_dict(unet.add_embedding.state_dict())
 
         for i, down_block in enumerate(unet.down_blocks):
             model.down_blocks[i].resnets.load_state_dict(down_block.resnets.state_dict())
@@ -965,7 +967,6 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
                     hidden_states=sample,
                     temb=emb,
                     num_frames=num_frames,
-                    key_scale=key_scale,
                     motion_attention_kwargs={'key_scale': key_scale},
                 )
 
@@ -987,13 +988,12 @@ class UNetMotionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin):
             # To support older versions of motion modules that don't have a mid_block
             if hasattr(self.mid_block, "motion_modules"):
                 sample = self.mid_block(
-                    sample,
-                    emb,
+                    hidden_states=sample,
+                    temb=emb,
                     encoder_hidden_states=encoder_hidden_states,
                     attention_mask=attention_mask,
                     num_frames=num_frames,
                     cross_attention_kwargs=cross_attention_kwargs,
-                    key_scale=key_scale,
                     motion_attention_kwargs={'key_scale': key_scale},
                 )
             else:
