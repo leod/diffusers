@@ -603,6 +603,7 @@ class AnimateDiffPipeline(
         multiprompt: bool = False,
         ctx_size: int = None,
         ctx_overlap: int = None,
+        key_scale = None,
         **kwargs,
     ):
         r"""
@@ -853,9 +854,8 @@ class AnimateDiffPipeline(
                         
                         #print('sub_latent_model_input', sub_latent_model_input.size())
                         
-                        # TODO
-                        #sub_key_scale = torch.cat([key_scale[slids]] * 2)
-                        #print('sub_key_scale', sub_key_scale)
+                        sub_key_scale = torch.cat([key_scale[slids]] * 2)
+                        print('sub_key_scale', sub_key_scale)
 
                         sub_noise_pred = self.unet(
                             sub_latent_model_input,
@@ -865,7 +865,7 @@ class AnimateDiffPipeline(
                             added_cond_kwargs=added_cond_kwargs,
                             return_dict=False,
                             multiprompt=True,
-                            # TODO: key_scale
+                            key_scale=sub_key_scale,
                         )[0]
                         
                         #print('sub_noise_pred', sub_noise_pred.size())
