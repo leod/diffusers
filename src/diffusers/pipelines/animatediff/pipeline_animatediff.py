@@ -854,8 +854,11 @@ class AnimateDiffPipeline(
                         
                         #print('sub_latent_model_input', sub_latent_model_input.size())
                         
-                        sub_key_scale = torch.cat([key_scale[slids]] * 2)
-                        print('sub_key_scale', sub_key_scale)
+                        if key_scale is not None:
+                            sub_key_scale = torch.cat([key_scale[slids]] * 2)
+                            print('sub_key_scale', sub_key_scale)
+                        else:
+                            sub_key_scale = None
 
                         sub_noise_pred = self.unet(
                             sub_latent_model_input,
