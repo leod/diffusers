@@ -261,7 +261,8 @@ class StableDiffusionLatentUpscalePipeline(DiffusionPipeline, StableDiffusionMix
     @torch.no_grad()
     def __call__(
         self,
-        prompt: Union[str, List[str]],
+        text_embeddings,
+        text_pooler_out,
         image: PipelineImageInput = None,
         num_inference_steps: int = 75,
         guidance_scale: float = 9.0,
@@ -359,23 +360,23 @@ class StableDiffusionLatentUpscalePipeline(DiffusionPipeline, StableDiffusionMix
         """
 
         # 1. Check inputs
-        self.check_inputs(prompt, image, callback_steps)
+        #self.check_inputs(prompt, image, callback_steps)
 
         # 2. Define call parameters
-        batch_size = 1 if isinstance(prompt, str) else len(prompt)
+        batch_size = 1
         device = self._execution_device
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
 
-        if guidance_scale == 0:
-            prompt = [""] * batch_size
+        #if guidance_scale == 0:
+        #    prompt = [""] * batch_size
 
         # 3. Encode input prompt
-        text_embeddings, text_pooler_out = self._encode_prompt(
-            prompt, device, do_classifier_free_guidance, negative_prompt
-        )
+        #text_embeddings, text_pooler_out = self._encode_prompt(
+        #    prompt, device, do_classifier_free_guidance, negative_prompt
+        #)
 
         # 4. Preprocess image
         image = self.image_processor.preprocess(image)
